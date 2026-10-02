@@ -6,7 +6,7 @@ VPN Gate SSTP 节点检测流水线
   1. 获取 VPN Gate 原始节点 (官方 api/iphone CSV, 失败时回退 GitHub 预解析镜像)
   2. 只保留「带 TCP 入口」的中继 = SSTP 可用节点
      (OpenVPN 配置里 proto tcp + remote <ip> <port>; UDP-only 中继无法走 SSTP/xray 链, 直接丢弃)
-  3. 按 host+port+protocol 去重
+  3. 按 host+port+protocol 去重 -> 按官方 Score/速度/Ping/在线时长筛选 -> 本地 TCP+TLS 预检 (不占 Worker)
   4. 并发调用已部署的 Cloudflare Worker:  GET {WORKER}/check?proxyip=host:port
      (单节点 HTTP 成功 != 节点可用; 以 Worker 返回 JSON 的 success 字段为准)
   5. 保留 success=true 的节点, 按国家分组, 生成 public/data.json + public/index.html
@@ -21,10 +21,14 @@ VPN Gate SSTP 节点检测流水线
 import base64
 import csv
 import io
+import ipaddress
 import json
 import os
 import re
+import socket
+import ssl
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -44,20 +48,39 @@ for _stream in (sys.stdout, sys.stderr):
 # ---------------------------------------------------------------------------
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
-VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
+# 官方接口: 先 HTTPS, 失败再回退 HTTP (逗号分隔, 可用环境变量覆盖)
+VPNGATE_APIS = [u.strip() for u in os.environ.get(
+    "VPNGATE_API", "https://www.vpngate.net/api/iphone/,http://www.vpngate.net/api/iphone/").split(",") if u.strip()]
 # 官方接口失败时的回退数据源: 预解析 JSON 镜像 (字段与官方 CSV 同源)
 VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
 # 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://ch.xw111.ccwu.cc/check?sstp=vpn:vpn@")
-CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
-CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
+# Worker 地址属于敏感信息: 不写死在仓库里, 必须由环境变量 / GitHub Secret 提供
+WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "").strip()
+CHECK_AUTH = os.environ.get("CHECK_AUTH", "").strip()                  # 可选: Worker 支持时以 Bearer 令牌鉴权
+CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "8")))   # 低并发 = 更平滑的 Worker 负载
+CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "45"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取数据源超时
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
+
+# --- 节点筛选: 只检测 / 只保留更快更稳的 (均可用环境变量覆盖) ---
+MIN_SPEED_MBPS = float(os.environ.get("MIN_SPEED_MBPS", "10"))        # VPN Gate 官方测速下限
+MAX_PING_MS = float(os.environ.get("MAX_PING_MS", "200"))             # VPN Gate 官方 Ping 上限
+MIN_UPTIME_HOURS = float(os.environ.get("MIN_UPTIME_HOURS", "12"))    # 在线时长下限 (24h 一次检测, 要选稳的)
+MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "150"))         # 最多送 Worker 检测的节点数
+PER_COUNTRY_CANDIDATES = int(os.environ.get("PER_COUNTRY_CANDIDATES", "15"))
+KEEP_PER_COUNTRY = int(os.environ.get("KEEP_PER_COUNTRY", "8"))       # 每国最多保留 (够数即提前停止检测)
+MAX_LATENCY_MS = float(os.environ.get("MAX_LATENCY_MS", "3000"))      # Worker 实测延迟上限
+PRECHECK = os.environ.get("PRECHECK", "1") != "0"                     # 本地 TCP+TLS 预检, 先剔除死节点
+PRECHECK_TIMEOUT = float(os.environ.get("PRECHECK_TIMEOUT", "6"))
+PRECHECK_WORKERS = int(os.environ.get("PRECHECK_WORKERS", "64"))
+CLASH_MAX_NODES = int(os.environ.get("CLASH_MAX_NODES", "40"))
+# 含 UUID 的订阅文件放进「令牌目录」发布 (公开仓库的 Pages 是公开的, 不能让人直接猜到 sub.txt)
+SUB_TOKEN = os.environ.get("SUB_TOKEN", "").strip()
 
 # 出口数据中心的关键词启发 (判断"是否住宅 IP"用, 页面标注为估算)
 DATA_CENTER_ORG_KEYWORDS = [
@@ -120,22 +143,23 @@ def die(msg):
 def fetch_vpngate():
     """返回 (rows, source)。rows: [{host, ip, country_long, country_short, config_b64}]
     官方 API 失败时回退镜像 JSON; 两个都失败 -> 直接 die (exit 1)。"""
-    # --- 主源: 官方 CSV ---
-    try:
-        log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
-        resp = requests.get(
-            VPNGATE_API,
-            timeout=HTTP_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"},
-        )
-        resp.raise_for_status()
-        rows = parse_csv(resp.text)
-        if rows:
-            log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
-            return rows, "vpngate.net/api/iphone"
-        raise RuntimeError("官方 API 返回 0 行数据")
-    except Exception as exc:
-        log("VPN GATE", f"官方 API 获取失败: {exc}")
+    # --- 主源: 官方 CSV (先 HTTPS, 失败再 HTTP) ---
+    for api in VPNGATE_APIS:
+        try:
+            log("VPN GATE", f"获取官方 API: {api}")
+            resp = requests.get(
+                api,
+                timeout=HTTP_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"},
+            )
+            resp.raise_for_status()
+            rows = parse_csv(resp.text)
+            if rows:
+                log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
+                return rows, "vpngate.net/api/iphone"
+            raise RuntimeError("官方 API 返回 0 行数据")
+        except Exception as exc:
+            log("VPN GATE", f"官方 API 获取失败: {exc}")
 
     # --- 回退源: GitHub 预解析镜像 ---
     try:
@@ -149,6 +173,13 @@ def fetch_vpngate():
     except Exception as exc:
         log("VPN GATE", f"回退镜像也失败: {exc}")
     die("VPN Gate 官方 API 与回退镜像均不可用, 数据源完全失败 (不生成空结果, 本次运行判定失败)")
+
+
+def _num(v):
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_csv(text):
@@ -166,7 +197,8 @@ def parse_csv(text):
     data_lines = lines[header_idx + 1:]
     # 列名映射 (不假设固定位置, 列名变化时自动适配; 全缺失时回退到已知位置)
     idx = {}
-    for col in ("hostname", "ip", "countrylong", "countryshort", "openvpn_configdata_base64"):
+    for col in ("hostname", "ip", "countrylong", "countryshort", "openvpn_configdata_base64",
+                "score", "ping", "speed", "uptime"):
         for i, h in enumerate(header):
             if h.strip().lstrip("*").lower() == col:
                 idx[col] = i
@@ -180,7 +212,9 @@ def parse_csv(text):
            "ip": idx.get("ip", 1),
            "countrylong": idx.get("countrylong", 5),
            "countryshort": idx.get("countryshort", 6),
-           "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1)}
+           "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1),
+           "score": idx.get("score", 2), "ping": idx.get("ping", 3),
+           "speed": idx.get("speed", 4), "uptime": idx.get("uptime", 8)}
 
     rows = []
     for ln in data_lines:
@@ -191,12 +225,18 @@ def parse_csv(text):
         ip = fields[pos["ip"]].strip()
         if not host or not ip:
             continue
+        def g(k):
+            return fields[pos[k]] if pos[k] < len(fields) else None
         rows.append({
             "host": host,
             "ip": ip,
             "country_long": fields[pos["countrylong"]].strip(),
             "country_short": fields[pos["countryshort"]].strip(),
             "config_b64": fields[pos["openvpn_configdata_base64"]].strip(),
+            "score": _num(g("score")),
+            "ping": _num(g("ping")),
+            "speed_bps": _num(g("speed")),
+            "uptime_ms": _num(g("uptime")),
         })
     return rows
 
@@ -222,6 +262,10 @@ def parse_mirror_json(data):
             "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(),
             "country_short": str(s.get("countryshort") or s.get("country_short") or "").strip(),
             "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip(),
+            "score": _num(s.get("score")),
+            "ping": _num(s.get("ping")),
+            "speed_bps": _num(s.get("speed")),
+            "uptime_ms": _num(s.get("uptime")),
         })
     return rows
 
@@ -231,6 +275,42 @@ def parse_mirror_json(data):
 # ---------------------------------------------------------------------------
 _PROTO_TCP_RE = re.compile(r"^proto\s+(tcp|tcp4|tcp6)\b", re.M)
 _REMOTE_RE = re.compile(r"^remote\s+\S+\s+(\d+)", re.M)
+
+
+_HOST_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def normalize_host(raw):
+    """只接受 *.opengw.net (VPN Gate 官方 DDNS) 且字符合法的主机名。
+    防止第三方镜像 / 被篡改的数据把任意域名或换行注入到订阅文件里。"""
+    h = (raw or "").strip().lower().rstrip(".")
+    if not h:
+        return None
+    if "." not in h:
+        h += ".opengw.net"
+    if not h.endswith(".opengw.net") or len(h) > 253:
+        return None
+    if not all(_HOST_LABEL_RE.match(label) for label in h.split(".")):
+        return None
+    return h
+
+
+def normalize_ip(raw):
+    """只接受公网 IP (拒绝内网 / 回环 / 链路本地, 避免预检被诱导去探测内部地址)。"""
+    try:
+        a = ipaddress.ip_address((raw or "").strip())
+    except ValueError:
+        return None
+    return str(a) if a.is_global else None
+
+
+def clean_text(s, limit=40):
+    return re.sub(r"[^\w .,'()\-]", "", s or "")[:limit].strip()
+
+
+def clean_cc(s):
+    s = (s or "").strip().upper()
+    return s if re.fullmatch(r"[A-Z]{2}", s) else ""
 
 
 def to_sstp_nodes(rows):
@@ -252,15 +332,21 @@ def to_sstp_nodes(rows):
         port = int(m.group(1))
         if not (1 <= port <= 65535):
             continue
-        host = r["host"]
-        if not host.endswith(".opengw.net"):
-            host = f"{host}.opengw.net"
+        host = normalize_host(r["host"])
+        ip = normalize_ip(r["ip"])
+        if not host or not ip:
+            continue
+        spd, upt = r.get("speed_bps"), r.get("uptime_ms")
         nodes.append({
             "host": host,
             "port": port,
-            "ip": r["ip"],
-            "country": r["country_long"],
-            "country_code": r["country_short"],
+            "ip": ip,
+            "country": clean_text(r["country_long"]),
+            "country_code": clean_cc(r["country_short"]),
+            "score": r.get("score"),
+            "ping": r.get("ping"),
+            "speed_mbps": round(spd / 1e6, 1) if spd is not None else None,
+            "uptime_h": round(upt / 3.6e6, 1) if upt is not None else None,
         })
     return nodes
 
@@ -276,6 +362,72 @@ def dedupe(nodes):
         seen.add(key)
         out.append(n)
     return out
+
+
+def select_candidates(nodes, limit):
+    """按 VPN Gate 官方指标 (速度/Ping/在线时长) 筛出更快更稳的节点, 再按 Score 排序,
+    每国限量。指标缺失 (如镜像数据) 的节点不当作不合格; 筛得太少时自动放宽, 不会出空结果。"""
+    def ok(n):
+        if n.get("speed_mbps") is not None and n["speed_mbps"] < MIN_SPEED_MBPS:
+            return False
+        if n.get("ping") is not None and n["ping"] > MAX_PING_MS:
+            return False
+        if n.get("uptime_h") is not None and n["uptime_h"] < MIN_UPTIME_HOURS:
+            return False
+        return True
+
+    def rank(n):
+        ping = n["ping"] if n.get("ping") is not None else 9999
+        return (-(n.get("score") or 0), -(n.get("speed_mbps") or 0), ping)
+
+    good = [n for n in nodes if ok(n)]
+    if len(good) < 20:
+        log("VPN GATE", f"达标节点仅 {len(good)} 个, 放宽阈值改按 Score 排序")
+        good = list(nodes)
+    good.sort(key=rank)
+    picked, per = [], {}
+    for n in good:
+        c = n.get("country_code") or n.get("country") or "?"
+        if per.get(c, 0) >= PER_COUNTRY_CANDIDATES:
+            continue
+        per[c] = per.get(c, 0) + 1
+        picked.append(n)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+# 预检只做 TCP + TLS 握手 (活性探测), 不发送任何账号数据, 所以不校验自签证书
+_TLS_CTX = ssl.create_default_context()
+_TLS_CTX.check_hostname = False
+_TLS_CTX.verify_mode = ssl.CERT_NONE
+
+
+def precheck_one(node):
+    try:
+        with socket.create_connection((node["ip"], node["port"]), timeout=PRECHECK_TIMEOUT) as raw:
+            raw.settimeout(PRECHECK_TIMEOUT)
+            with _TLS_CTX.wrap_socket(raw, server_hostname=node["host"]):
+                pass
+        return node, True
+    except Exception:
+        return node, False
+
+
+def precheck(nodes):
+    """在 GitHub runner 上本地探测, 把明显已死的节点挡在 Worker 之外 (这一步不消耗 Cloudflare CPU)。"""
+    if not PRECHECK or not nodes:
+        return nodes
+    alive = []
+    with ThreadPoolExecutor(max_workers=PRECHECK_WORKERS) as pool:
+        for node, ok in pool.map(precheck_one, nodes):
+            if ok:
+                alive.append(node)
+    log("PRECHECK", f"本地 TCP+TLS 预检: {len(alive)}/{len(nodes)} 存活")
+    if not alive:
+        log("PRECHECK", "预检全部失败 (可能是运行环境网络受限), 跳过预检, 直接交给 Worker")
+        return nodes
+    return alive
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +471,10 @@ def check_one(node, session):
     out["exit"] = None
     out["residential"] = "unknown"
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        headers = {"User-Agent": "Mozilla/5.0 (gate-checker)"}
+        if CHECK_AUTH:
+            headers["Authorization"] = f"Bearer {CHECK_AUTH}"
+        r = session.get(url, timeout=CHECK_TIMEOUT, headers=headers)
         if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
             out["worker_error"] = True
@@ -352,26 +507,57 @@ def check_one(node, session):
             out["residential"] = classify_network(out["host"], None, None)
         return out
     except Exception as exc:
-        out["error"] = f"{type(exc).__name__}: {exc}"
+        out["error"] = type(exc).__name__   # 不带异常正文: requests 的异常信息里会含 Worker URL
         out["worker_error"] = True
         return out
 
 
 def check_all(nodes, session):
-    """32 并发 (与网页端一致)。单节点失败不影响整体; 但区分'节点不可用'与'Worker 异常'。"""
+    """低并发检测。某国成功数已够 KEEP_PER_COUNTRY 就不再检测该国剩余节点 (节省 Worker CPU)。
+    区分'节点不可用'与'Worker 异常'。"""
+    done, lock = {}, threading.Lock()
+
+    def work(n):
+        c = n.get("country_code") or n.get("country") or "?"
+        with lock:
+            if done.get(c, 0) >= KEEP_PER_COUNTRY:
+                return {"skipped": True}
+        r = check_one(n, session)
+        if r.get("success"):
+            with lock:
+                done[c] = done.get(c, 0) + 1
+        return r
+
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session) for n in nodes]
+        futures = [pool.submit(work, n) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
-    return results
+    skipped = sum(1 for r in results if r.get("skipped"))
+    if skipped:
+        log("CLOUDFLARE WORKER", f"已够数, 跳过检测: {skipped}")
+    return [r for r in results if not r.get("skipped")]
 
 
 # ---------------------------------------------------------------------------
 # 第 4 步: 生成网页数据
 # ---------------------------------------------------------------------------
 def build_outputs(results, raw_count, sstp_count, source):
-    available = [r for r in results if r.get("success")]
+    all_ok = [r for r in results if r.get("success")]
+
+    def lat(r):
+        return _num(r.get("latency_ms"))
+
+    # 只留够快的: 超过 MAX_LATENCY_MS 的丢弃 (延迟未知视为保留; 全被筛掉则不筛, 避免出空结果)
+    fast = [r for r in all_ok if lat(r) is None or lat(r) <= MAX_LATENCY_MS] or all_ok
+    fast.sort(key=lambda r: (lat(r) is None, lat(r) or 0, r["host"]))
+    per, available = {}, []
+    for r in fast:
+        c = r["country"] or "未知"
+        if per.get(c, 0) >= KEEP_PER_COUNTRY:
+            continue
+        per[c] = per.get(c, 0) + 1
+        available.append(r)
     countries = {}
     for n in available:
         c = n["country"] or "未知"
@@ -382,7 +568,8 @@ def build_outputs(results, raw_count, sstp_count, source):
         "sstp_nodes": sstp_count,
         "checked": len(results),
         "success": len(available),
-        "failed": len(results) - len(available),
+        "success_total": len(all_ok),
+        "failed": len(results) - len(all_ok),
         "countries": len(countries),
         "residential_est": sum(1 for n in available if n["residential"] == "residential"),
         "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),
@@ -399,7 +586,6 @@ def build_outputs(results, raw_count, sstp_count, source):
     data = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "source": source,
-        "worker": WORKER_CHECK_URL,
         "stats": stats,
         "countries": by_country,
         "available": available,
@@ -412,16 +598,16 @@ CHAIN_URL = os.environ.get("CHAIN_URL", "https://jerylihub.github.io/gate/chains
 
 def build_chains_text(data):
     """生成 edgetunnel 链式代理清单: 按国家分组, 每国编号固定, 住宅优先, 延迟升序。
-    每行 = 「名字 + $sstp://vpn:vpn@host:port」, 名字不变, 指令每 30 分钟自动换。"""
+    每行 = 「名字 + $sstp://vpn:vpn@host:port」, 名字不变, 指令每 24 小时自动换。"""
     countries = data["countries"]
     lines = [
         "# VPN Gate SSTP 节点 -> edgetunnel 链式代理清单",
-        f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
+        f"# 自动更新: {data['generated_at']} (每 24 小时重新检测)",
         f"# 固定地址: {CHAIN_URL}",
         "#",
         "# 用法: 在 edgetunnel 节点备注里直接粘贴下面任意一行 (名字与指令连写)",
         "#   例: 日本-住宅-01$sstp://vpn:vpn@vpnxxx.opengw.net:443",
-        "# 名字保持不变, 只有 $sstp:// 后面的地址每 30 分钟自动更换",
+        "# 名字保持不变, 只有 $sstp:// 后面的地址每 24 小时自动更换",
         "# 账号密码固定 vpn:vpn ; 端口必须保留",
         "# ========================================================",
     ]
@@ -471,19 +657,21 @@ HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.
 
 def build_hosts_text(data):
     """生成可直接粘贴到 edgetunnel 后台「自定义优选IP」框的清单。
-    每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 30 分钟自动换。"""
+    每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 24 小时自动换。"""
     countries = data["countries"]
     # 入口: 默认用 7 个实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
+    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or ([f"{EDT_DOMAIN}:443"] if EDT_DOMAIN else [])
+    if not edge:
+        return "# 未配置入口地址 (EDGE_HOSTS / HOSTS_ENTRY / EDT_DOMAIN)\n"
     lines = [
         "# edgetunnel「自定义优选IP」清单 (整段复制, 追加到后台现有内容后面)",
-        f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
+        f"# 自动更新: {data['generated_at']} (每 24 小时重新检测)",
         f"# 固定地址: {HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
         "# 入口用 7 个实测可用优选域名循环分配",
         "# 名字 = 国家-住宅/机房-编号, 直接区分住宅与机房",
-        "# 名字固定; 只有 $sstp:// 后面的节点地址每 30 分钟自动更换",
+        "# 名字固定; 只有 $sstp:// 后面的节点地址每 24 小时自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
         "# ========================================================",
     ]
@@ -522,10 +710,11 @@ def build_hosts_text(data):
 
 
 # edgetunnel 完整订阅 (vless://) 配置
-EDT_UUID = os.environ.get("EDT_UUID", "77111067-9f86-4d8d-88d2-9bdda79f5136")
-EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "winter-bread-4d5f.kyousuke8328.workers.dev")
+# UUID / 域名是你的 edgetunnel 凭据: 不写进仓库, 只从环境变量 (GitHub Secrets) 读取
+EDT_UUID = os.environ.get("EDT_UUID", "").strip()
+EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "").strip()
 EDT_FINGERPRINT = os.environ.get("EDT_FINGERPRINT", "chrome")
-SUB_URL = os.environ.get("SUB_URL", "https://jerylihub.github.io/gate/sub.txt")
+SUB_URL = os.environ.get("SUB_URL", "")
 
 
 def _b64_secret_encode(plaintext, secret):
@@ -560,16 +749,22 @@ def _socks5_account(address, default_port=80):
     return {"username": username, "password": password, "hostname": hostname, "port": port}
 
 
+def _chain_path(n):
+    chain = {"type": "sstp", **_socks5_account(f"vpn:vpn@{n['host']}:{n['port']}", 443)}
+    chain_json = json.dumps(chain, separators=(",", ":"))
+    return "/video/" + _b64_secret_encode(chain_json, EDT_UUID)
+
+
 def build_sub_text(data):
     """生成 edgetunnel 完整 vless:// 订阅 (链式代理编码在 path)。
     填进 edgetunnel 后台「订阅链接」URL, 客户端定时拉取即可自动轮换。"""
     countries = data["countries"]
     lines = [
         "# edgetunnel 完整订阅 (vless://) —— 填进后台「订阅链接」URL",
-        f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
-        f"# 固定地址: {SUB_URL}",
+        f"# 自动更新: {data['generated_at']} (每 24 小时重新检测)",
+        f"# 固定地址: {SUB_URL or '(Pages 地址/<令牌>/sub.txt)'}",
         f"# 节点域名: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
-        "# 名字固定; $sstp:// 链式代理(编码在 path)每 30 分钟自动更换",
+        "# 名字固定; $sstp:// 链式代理(编码在 path)每 24 小时自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口已编码进 path",
         "# ========================================================",
     ]
@@ -591,10 +786,7 @@ def build_sub_text(data):
         )
         for i, n in enumerate(nodes, 1):
             name = f"{zh}-{i:02d}"
-            chain = {"type": "sstp", **_socks5_account(f"vpn:vpn@{n['host']}:{n['port']}", 443)}
-            chain_json = json.dumps(chain, separators=(",", ":"))
-            enc = _b64_secret_encode(chain_json, EDT_UUID)
-            path = quote("/video/" + enc, safe="")
+            path = quote(_chain_path(n), safe="")
             link = (
                 f"vless://{EDT_UUID}@{EDT_DOMAIN}:443?security=tls&type=ws"
                 f"&host={EDT_DOMAIN}&fp={EDT_FINGERPRINT}&sni={EDT_DOMAIN}"
@@ -604,14 +796,155 @@ def build_sub_text(data):
     return "\n".join(lines) + "\n"
 
 
+def build_clash_text(data):
+    """生成 mihomo (Clash.Meta) 配置: 自带防 DNS 泄露设置。
+    - fake-ip + 域名交给代理侧解析, DoH 走代理 (respect-rules), 不用系统/ISP DNS
+    - 阻断 UDP/443 (QUIC) 且节点 udp:false, 避免 WebRTC/QUIC 绕过代理
+    - 内网直连, 其余全部走代理 (MATCH)"""
+    def key(n):
+        v = _num(n.get("latency_ms"))
+        return (v is None, v or 0, n.get("host") or "")
+
+    nodes = sorted(data["available"], key=key)[:CLASH_MAX_NODES]
+    if not nodes:
+        return None
+    q = lambda v: json.dumps(v, ensure_ascii=False)
+    names, proxy_lines, seen = [], [], {}
+    for n in nodes:
+        code = str(n.get("country_code") or "?").upper()
+        zh = COUNTRY_ZH.get(code) or code
+        seen[zh] = seen.get(zh, 0) + 1
+        name = f"{zh}-{seen[zh]:02d}"
+        names.append(name)
+        proxy_lines += [
+            f"  - name: {q(name)}",
+            "    type: vless",
+            f"    server: {q(EDT_DOMAIN)}",
+            "    port: 443",
+            f"    uuid: {q(EDT_UUID)}",
+            "    udp: false",
+            "    tls: true",
+            f"    servername: {q(EDT_DOMAIN)}",
+            f"    client-fingerprint: {EDT_FINGERPRINT}",
+            "    skip-cert-verify: false",
+            "    network: ws",
+            "    ws-opts:",
+            f"      path: {q(_chain_path(n))}",
+            "      headers:",
+            f"        Host: {q(EDT_DOMAIN)}",
+        ]
+    name_list = ", ".join(q(x) for x in names)
+    lines = [
+        f"# VPN Gate 节点 · mihomo(Clash.Meta) 配置 · 更新: {data['generated_at']} (每 24 小时)",
+        "# 含你的 UUID, 请勿公开转发。需要 mihomo 内核 (Clash Verge Rev / FlClash / Clash Meta 等)。",
+        "mixed-port: 7890",
+        "allow-lan: false",
+        "mode: rule",
+        "log-level: warning",
+        "ipv6: false",
+        "unified-delay: true",
+        "tcp-concurrent: true",
+        "",
+        "dns:",
+        "  enable: true",
+        "  ipv6: false",
+        "  enhanced-mode: fake-ip",
+        "  fake-ip-range: 198.18.0.1/16",
+        '  fake-ip-filter: ["*.lan", "*.local"]',
+        "  default-nameserver: [1.1.1.1, 8.8.8.8]          # 仅用于启动引导 (全部是 IP, 不解析任何域名)",
+        '  nameserver: ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]',
+        '  proxy-server-nameserver: ["https://1.1.1.1/dns-query"]   # 只用来解析你的 Worker 域名',
+        "  respect-rules: true                              # DNS 查询也走代理规则, 不走本地运营商 DNS",
+        "",
+        "sniffer:",
+        "  enable: true",
+        "  sniff:",
+        "    HTTP: {ports: [80, 8080-8880]}",
+        "    TLS: {ports: [443, 8443]}",
+        "",
+        "tun:",
+        "  enable: false          # 想接管所有软件(含不走系统代理的)就改成 true, 需要管理员/root 权限",
+        "  stack: mixed",
+        "  auto-route: true",
+        "  strict-route: true",
+        "  auto-detect-interface: true",
+        '  dns-hijack: ["any:53", "tcp://any:53"]',
+        "",
+        "proxies:",
+        *proxy_lines,
+        "",
+        "proxy-groups:",
+        "  - name: PROXY",
+        "    type: select",
+        f"    proxies: [\"AUTO\", {name_list}]",
+        "  - name: AUTO",
+        "    type: url-test",
+        "    url: https://www.gstatic.com/generate_204",
+        "    interval: 1800        # 每次测速都会经过你的 Worker, 间隔别调太小",
+        "    tolerance: 150",
+        "    lazy: true",
+        f"    proxies: [{name_list}]",
+        "",
+        "rules:",
+        "  - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT      # 阻断 QUIC, 强制回落到 TCP 走代理",
+        "  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+        "  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+        "  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+        "  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+        "  - MATCH,PROXY",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def build_sub_b64(data):
+    """通用 base64 订阅 (去掉所有 # 注释行, 只留 vless:// 链接)。
+    小火箭 / v2rayN / NekoBox 等都认这种格式, 比带注释的 sub.txt 兼容性更好。"""
+    links = [ln for ln in build_sub_text(data).splitlines() if ln.strip() and not ln.startswith("#")]
+    if not links:
+        return None
+    return base64.b64encode(("\n".join(links) + "\n").encode("utf-8")).decode("ascii") + "\n"
+
+
+def build_shadowrocket_conf(data):
+    """小火箭配置文件: 只放 DNS / IPv6 / 规则, 节点来自 sub_b64.txt 订阅。
+    规则最后一条 FINAL,PROXY = 全部走你当前选中的节点。"""
+    return "\n".join([
+        f"# 小火箭配置 · 更新: {data['generated_at']} (每 24 小时)",
+        "# 用法: 小火箭 -> 配置 -> 右上角 + -> 填本文件 URL 下载 -> 点选它 -> 选「使用配置」",
+        "# 节点另外用 sub_b64.txt 订阅导入 (首页 -> 右上角 + -> 类型选 Subscribe)",
+        "",
+        "[General]",
+        "bypass-system = true",
+        "skip-proxy = 127.0.0.1, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, localhost, *.local",
+        "ipv6 = false",
+        "dns-server = https://1.1.1.1/dns-query, https://8.8.8.8/dns-query",
+        "private-ip-answer = true",
+        "udp-policy-not-supported-behaviour = REJECT",
+        "",
+        "[Rule]",
+        "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+        "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+        "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+        "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+        "FINAL,PROXY",
+        "",
+    ])
+
+
 def write_outputs(data):
+    """返回已写出文件的显示名列表 (含令牌的路径只显示占位符, 避免令牌进入公开的 Actions 日志)。"""
     os.makedirs(PUBLIC_DIR, exist_ok=True)
-    data_path = os.path.join(PUBLIC_DIR, "data.json")
-    with open(data_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
+    written = []
+
+    def _write(path, text, label):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        written.append(label)
+
+    _write(os.path.join(PUBLIC_DIR, "data.json"),
+           json.dumps(data, ensure_ascii=False, indent=1), "public/data.json")
 
     # 固定网页: 始终用 web/index.html 模板生成同一个 index.html (数据来自 data.json)
-    html_path = os.path.join(PUBLIC_DIR, "index.html")
     if os.path.exists(TEMPLATE_HTML):
         with open(TEMPLATE_HTML, "r", encoding="utf-8") as f:
             html = f.read()
@@ -619,30 +952,41 @@ def write_outputs(data):
         html = ("<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head>"
                 "<body><h1>VPN Gate SSTP 节点</h1><pre id='out'></pre></body>"
                 "<script>fetch('data.json').then(r=>r.json()).then(d=>out.textContent=JSON.stringify(d.stats)).catch(e=>out.textContent='加载失败:'+e)</script></html>")
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    _write(os.path.join(PUBLIC_DIR, "index.html"), html, "public/index.html")
 
-    # edgetunnel 链式代理清单 (固定 URL, 方案一: 名字不变、指令自动换)
-    chains_path = os.path.join(PUBLIC_DIR, "chains.txt")
-    with open(chains_path, "w", encoding="utf-8") as f:
-        f.write(build_chains_text(data))
+    # 不含凭据的清单 (只有 SSTP 节点地址, 公开无妨)
+    _write(os.path.join(PUBLIC_DIR, "chains.txt"), build_chains_text(data), "public/chains.txt")
+    _write(os.path.join(PUBLIC_DIR, "hosts.txt"), build_hosts_text(data), "public/hosts.txt")
+    # 请搜索引擎别收录
+    _write(os.path.join(PUBLIC_DIR, "robots.txt"), "User-agent: *\nDisallow: /\n", "public/robots.txt")
 
-    # 可直接粘贴进后台「自定义优选IP」框的清单 (入口地址#名字$sstp://...)
-    hosts_path = os.path.join(PUBLIC_DIR, "hosts.txt")
-    with open(hosts_path, "w", encoding="utf-8") as f:
-        f.write(build_hosts_text(data))
-
-    # 完整 vless:// 订阅 (填进后台「订阅链接」URL, 客户端自动轮换)
-    sub_path = os.path.join(PUBLIC_DIR, "sub.txt")
-    with open(sub_path, "w", encoding="utf-8") as f:
-        f.write(build_sub_text(data))
-    return data_path, html_path, chains_path, hosts_path, sub_path
+    # 含 UUID 的订阅 / Clash 配置: 配齐 EDT_UUID + EDT_DOMAIN + SUB_TOKEN 才生成, 且放进令牌目录
+    if EDT_UUID and EDT_DOMAIN and SUB_TOKEN:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,}", SUB_TOKEN):
+            die("SUB_TOKEN 必须是 20 位以上的字母/数字/-/_ (建议 openssl rand -hex 16 以上)")
+        priv = os.path.join(PUBLIC_DIR, SUB_TOKEN)
+        os.makedirs(priv, exist_ok=True)
+        _write(os.path.join(priv, "sub.txt"), build_sub_text(data), "public/<SUB_TOKEN>/sub.txt")
+        clash = build_clash_text(data)
+        if clash:
+            _write(os.path.join(priv, "clash.yaml"), clash, "public/<SUB_TOKEN>/clash.yaml")
+        b64 = build_sub_b64(data)
+        if b64:
+            _write(os.path.join(priv, "sub_b64.txt"), b64, "public/<SUB_TOKEN>/sub_b64.txt")
+            _write(os.path.join(priv, "shadowrocket.conf"), build_shadowrocket_conf(data),
+                   "public/<SUB_TOKEN>/shadowrocket.conf")
+    else:
+        log("WEBSITE", "未配置 EDT_UUID / EDT_DOMAIN / SUB_TOKEN: 不生成 sub.txt / clash.yaml 等含 UUID 的文件 "
+                       "(按「hosts.txt 粘贴进 edgetunnel 后台」的流程使用时不需要它们)")
+    return written
 
 
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def main():
+    if not WORKER_CHECK_URL.startswith("https://"):
+        die("未配置 CHECK_WORKER (必须是 https:// 开头)。请在仓库 Settings -> Secrets 里添加 CHECK_WORKER。")
     session = requests.Session()
 
     # 1) 数据源
@@ -657,13 +1001,17 @@ def main():
     if sstp_count == 0:
         die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点 — 数据格式可能已变化, 需要人工适配")
     uniq = dedupe(sstp_nodes)
-
-    if MAX_CHECK_NODES > 0:
-        uniq = uniq[:MAX_CHECK_NODES]
-
     log("VPN GATE", f"获取原始节点: {raw_count}")
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
     log("VPN GATE", f"去重后: {len(uniq)}")
+
+    # 先用官方指标筛, 再本地预检, 只把少量高质量候选交给 Worker (降低 Cloudflare CPU)
+    pool = select_candidates(uniq, MAX_CANDIDATES * 2 if PRECHECK else MAX_CANDIDATES)
+    log("VPN GATE", f"速度/延迟/在线时长筛选后: {len(pool)}")
+    uniq = precheck(pool)[:MAX_CANDIDATES]
+    if MAX_CHECK_NODES > 0:
+        uniq = uniq[:MAX_CHECK_NODES]
+    log("VPN GATE", f"提交 Worker 检测的候选: {len(uniq)}")
 
     # 3) 并发检测
     log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
@@ -688,12 +1036,8 @@ def main():
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
-    data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
-    log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(chains_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(hosts_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(sub_path, REPO_DIR)}")
+    for name in write_outputs(data):
+        log("WEBSITE", f"生成 {name}")
     log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
 
 
