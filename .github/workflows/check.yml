@@ -1,15 +1,15 @@
 name: VPN Gate Node Check
 
 on:
+  # 定时检测: 默认每 30 分钟一次。改成每 60 分钟: cron: "0 * * * *"
   schedule:
-    # 每天 1 次: UTC 03:17 = 日本时间 12:17。避开整点, 减少 GitHub 定时任务排队延迟。
-    # 想改成每 12 小时: cron: "17 3,15 * * *"
-    - cron: "17 3 * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
-# 最小权限: 跑脚本的 job 只读代码; 只有 deploy job 才有 Pages 写权限
 permissions:
   contents: read
+  pages: write
+  id-token: write
 
 concurrency:
   group: gate-check
@@ -18,52 +18,27 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Get VPN Gate nodes + precheck + check via Cloudflare Worker + build page
+      - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
         run: python vpngate.py
         env:
-          # 放在仓库 Settings -> Secrets and variables -> Actions -> Secrets
-          CHECK_WORKER: ${{ secrets.CHECK_WORKER }}   # 原来的 https://check.helei.kdns.fr/check?sstp=vpn:vpn@
-          CHECK_AUTH: ${{ secrets.CHECK_AUTH }}       # 可选: Worker 支持 Bearer 鉴权时才填, 否则留空
-          # 按「hosts.txt 粘贴进 edgetunnel 后台」使用时, 下面三项不需要 (UUID 也就不用放进仓库):
-          # EDT_UUID: ${{ secrets.EDT_UUID }}
-          # EDT_DOMAIN: ${{ secrets.EDT_DOMAIN }}
-          # SUB_TOKEN: ${{ secrets.SUB_TOKEN }}
-          # 降低 Worker 负载
-          CHECK_CONCURRENCY: "8"
-          CHECK_TIMEOUT: "45"
+          # 已部署的检测 Worker (不要改动: 检测统一走这里)
+          CHECK_WORKER: "https://check.helei.kdns.fr/check?sstp=vpn:vpn@"
+          CHECK_CONCURRENCY: "32"
+          CHECK_TIMEOUT: "90"
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: public
-
-  deploy:
-    needs: check
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' \
@@ -71,11 +46,11 @@ jobs:
             "https://api.github.com/repos/$GITHUB_REPOSITORY/pages")
           echo "Pages API status: $code"
           if [ "$code" = "404" ]; then
-            echo "首次运行: 启用 GitHub Pages (source = GitHub Actions)"
+            echo "首次运行: 启用 GitHub Pages (source = GitHub Actions, 目录 /public)"
             curl -sS -X PUT \
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "Content-Type: application/json" \
-              -d '{"build_type":"workflow"}' \
+              -d '{"build_type":"workflow","source":{"branches":["main"],"path":"/public"}}' \
               "https://api.github.com/repos/$GITHUB_REPOSITORY/pages"
             echo
             sleep 10
@@ -83,6 +58,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'public'
+
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Show site URL
+        run: 'echo "site: https://jerylihub.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
